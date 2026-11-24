@@ -49,6 +49,7 @@ import {
   ResourceSubscriptionResult,
 } from '@platform-mesh/portal-ui-lib/models';
 import {
+  AccessReviewService,
   ErrorHandlerService,
   ResourceNodeContext,
   ResourceService,
@@ -61,8 +62,8 @@ import {
   permissionKey,
   resourceActionAllowed,
 } from '@platform-mesh/portal-ui-lib/utils';
-import { Subscription } from 'rxjs';
-import { finalize } from 'rxjs/operators';
+import { Observable, Subscription, throwError } from 'rxjs';
+import { catchError, finalize } from 'rxjs/operators';
 
 export interface ResourceTableReadFailure {
   code: number;
@@ -86,6 +87,7 @@ export interface ResourceTableReadFailure {
 })
 export class ResourceTableCard {
   private resourceService = inject(ResourceService);
+  private accessReviewService = inject(AccessReviewService);
   private errorHandlerService = inject(ErrorHandlerService);
   protected instancePermissionsStore = inject(InstancePermissionsStore);
   private destroyRef = inject(DestroyRef);
@@ -470,7 +472,11 @@ export class ResourceTableCard {
   }
 
   list(isInitialLoad: boolean = false) {
-    if (!this.canDo('list')) return;
+    const fromAccessReview =
+      !!this.resourceDefinition()?.ui?.listView?.accessReview;
+    // A review only ever has what the user can access, so it needs no
+    // permission to list.
+    if (!fromAccessReview && !this.canDo('list')) return;
     if (untracked(this.loading)) return;
     this.lastListWasInitialLoad = isInitialLoad;
     this.listError.set(null);
@@ -485,13 +491,26 @@ export class ResourceTableCard {
       entity: resourceDefinition.entityCollection,
     }) as string;
 
-    this.listSubscription = this.resourceService
-      .list(queryOperation, fields, context, {
+    const listFromGateway = () =>
+      this.resourceService.list(queryOperation, fields, context, {
         pagination: {
           limit: this.paginationLimit(),
           continue: this.currentContinueToken,
         },
-      })
+      });
+    // Where the review is not served (yet) or fails, the list is what it was
+    // without it.
+    const source: Observable<ResourceListResult> = fromAccessReview
+      ? this.accessReviewService
+          .listAccounts(context)
+          .pipe(
+            catchError((error) =>
+              this.canDo('list') ? listFromGateway() : throwError(() => error),
+            ),
+          )
+      : listFromGateway();
+
+    this.listSubscription = source
       .pipe(
         finalize(() => {
           this.loading.set(false);

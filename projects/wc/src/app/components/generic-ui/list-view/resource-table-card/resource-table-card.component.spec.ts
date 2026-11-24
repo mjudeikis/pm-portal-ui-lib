@@ -8,6 +8,7 @@ import {
   ResourceSubscriptionResult,
 } from '@platform-mesh/portal-ui-lib/models';
 import {
+  AccessReviewService,
   ErrorHandlerService,
   InstancePermissionsService,
   ResourceService,
@@ -22,6 +23,7 @@ describe('ResourceTableCard', () => {
   let fixture: ComponentFixture<ResourceTableCard>;
   let mockResourceService: MockedObject<ResourceService>;
   let mockErrorHandlerService: MockedObject<ErrorHandlerService>;
+  let mockAccessReviewService: MockedObject<AccessReviewService>;
   let mockInstancePermissionsService: MockedObject<InstancePermissionsService>;
   let mockInstancePermissionsLocalStore: MockedObject<InstancePermissionsStore>;
 
@@ -65,6 +67,7 @@ describe('ResourceTableCard', () => {
       of(undefined),
     );
     mockErrorHandlerService = mock();
+    mockAccessReviewService = mock();
     mockInstancePermissionsService = mock();
     // Default: checkInstances returns empty array so InstancePermissionsStore doesn't blow up
     mockInstancePermissionsService.checkInstances.mockReturnValue(of([]));
@@ -76,6 +79,7 @@ describe('ResourceTableCard', () => {
       providers: [
         { provide: ResourceService, useValue: mockResourceService },
         { provide: ErrorHandlerService, useValue: mockErrorHandlerService },
+        { provide: AccessReviewService, useValue: mockAccessReviewService },
         {
           provide: InstancePermissionsService,
           useValue: mockInstancePermissionsService,
@@ -2491,6 +2495,121 @@ describe('ResourceTableCard', () => {
         pd,
         expect.arrayContaining([expect.objectContaining({ name: 'c1' })]),
       );
+    });
+
+    describe('list from the access review (listView.accessReview)', () => {
+      const reviewed = {
+        items: [
+          {
+            id: 'team-a',
+            metadata: { name: 'team-a' },
+            spec: { type: 'account' },
+            ready: true,
+          },
+        ],
+        resourceVersion: '',
+        continue: undefined,
+      };
+
+      const makeReviewContext = (perms?: Record<string, string[]>) =>
+        signal({
+          portalPermissions: perms,
+          resourceDefinition: {
+            entityCollection: 'Accounts',
+            entity: 'Account',
+            apiGroup: 'core_platform_mesh_io',
+            version: 'v1alpha1',
+            permissionsDefinition: {
+              group: 'core.platform-mesh.io',
+              resource: 'accounts',
+              entityActions: [],
+              resourceActions: ['list'],
+              entityContextKey: 'entityName',
+            },
+            ui: { listView: { fields: [], accessReview: true } },
+          },
+        }) as any;
+
+      const create = (context: any) => {
+        mockResourceService.list.mockClear();
+        mockResourceService.resourceChangeSubscription.mockClear();
+        const newFixture = TestBed.createComponent(ResourceTableCard);
+        const newComponent = newFixture.componentInstance;
+        newComponent.context = context;
+        newComponent.LuigiClient = makeLuigiClient();
+        newFixture.detectChanges();
+        return newComponent;
+      };
+
+      it('shows what the review lists, without asking or watching the gateway', () => {
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          of(reviewed) as any,
+        );
+
+        const newComponent = create(makeReviewContext());
+
+        expect(mockAccessReviewService.listAccounts).toHaveBeenCalled();
+        expect(mockResourceService.list).not.toHaveBeenCalled();
+        expect(newComponent.resources()).toEqual(reviewed.items);
+        expect(newComponent.hasMore()).toBe(false);
+        expect(
+          mockResourceService.resourceChangeSubscription,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('asks the review also when the user may not list', () => {
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          of(reviewed) as any,
+        );
+
+        const newComponent = create(makeReviewContext({ accounts: ['get'] }));
+
+        expect(newComponent.resources()).toEqual(reviewed.items);
+        expect(mockResourceService.list).not.toHaveBeenCalled();
+      });
+
+      it('falls back to the gateway list when the review cannot be answered', () => {
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          throwError(() => new Error('404')),
+        );
+
+        const newComponent = create(makeReviewContext());
+
+        expect(mockResourceService.list).toHaveBeenCalledTimes(1);
+        expect(newComponent.resources().map((r) => r.metadata.name)).toEqual([
+          'test',
+        ]);
+        expect(newComponent.resourceVersion()).toBe('1234567890');
+      });
+
+      it('reports the error of the review when the user may not list either', () => {
+        mockErrorHandlerService.errorCode.mockReturnValue(503);
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          throwError(() => new Error('review failed')),
+        );
+        const readFailureChange = vi.fn();
+        mockResourceService.list.mockClear();
+        const newFixture = TestBed.createComponent(ResourceTableCard);
+        const newComponent = newFixture.componentInstance;
+        newComponent.context = makeReviewContext({ accounts: ['get'] });
+        newComponent.LuigiClient = makeLuigiClient();
+        newComponent.readFailureChange = signal(readFailureChange) as any;
+        newFixture.detectChanges();
+
+        expect(mockResourceService.list).not.toHaveBeenCalled();
+        expect(readFailureChange).toHaveBeenCalledWith(
+          expect.objectContaining({ code: 503 }),
+        );
+      });
+
+      it('does not ask the review unless the list view opts in', () => {
+        mockAccessReviewService.listAccounts.mockClear();
+
+        create(makeContext());
+
+        expect(mockAccessReviewService.listAccounts).not.toHaveBeenCalled();
+        expect(mockResourceService.list).toHaveBeenCalled();
+      });
     });
 
     describe('list() guard (canDo("list"))', () => {
