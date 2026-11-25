@@ -92,8 +92,8 @@ export interface ListView extends UiView {
    * If the review cannot be answered (the virtual workspace is not installed,
    * not registered with the gateway, or fails), the list falls back to the
    * list of the resources, so the option can be turned on before every
-   * installation serves the review. A list from a review is not paged and not
-   * updated live.
+   * installation serves the review. A list from a review is not paged; it is
+   * kept up to date by a subscription to the review.
    */
   accessReview?: boolean | AccessReviewOptions;
 }

@@ -3,6 +3,8 @@ import {
   AccessReviewService,
   SelfClusterAccessReview,
   accessReviewMutation,
+  accessReviewSubscription,
+  accessReviewSubscriptionField,
 } from './access-review.service';
 import { GatewayService } from './gateway.service';
 import { ResourceNodeContext } from './resource-node-context';
@@ -13,6 +15,12 @@ import { LuigiCoreService } from '@openmfp/portal-ui-lib';
 import { firstValueFrom, of, throwError } from 'rxjs';
 import { MockedObject } from 'vitest';
 import { mock } from 'vitest-mock-extended';
+
+const { createClientMock } = vi.hoisted(() => ({ createClientMock: vi.fn() }));
+
+vi.mock('graphql-sse', () => ({
+  createClient: createClientMock,
+}));
 
 const makeContext = (overrides: object = {}): ResourceNodeContext =>
   ({
@@ -275,5 +283,93 @@ describe('AccessReviewService', () => {
     await expect(
       firstValueFrom(service.listAccounts(makeContext())),
     ).rejects.toThrow('Not an access review');
+  });
+  describe('watchAccounts', () => {
+    let sink: any;
+    let unsubscribe: ReturnType<typeof vi.fn>;
+    let client: {
+      subscribe: ReturnType<typeof vi.fn>;
+      dispose: ReturnType<typeof vi.fn>;
+    };
+
+    const event = (r: SelfClusterAccessReview, type = 'MODIFIED') => ({
+      data: { [accessReviewSubscriptionField]: { type, object: r } },
+    });
+
+    beforeEach(() => {
+      unsubscribe = vi.fn();
+      client = {
+        subscribe: vi.fn((_request, s) => {
+          sink = s;
+          return unsubscribe;
+        }),
+        dispose: vi.fn(),
+      };
+      createClientMock.mockReset();
+      createClientMock.mockReturnValue(client);
+    });
+
+    it('subscribes to the review through the gateway, addressed to the workspace, as the user', () => {
+      service.watchAccounts(makeContext()).subscribe();
+
+      const options = createClientMock.mock.calls[0][0];
+      expect(options.url).toBe(
+        'https://portal.example.com/api/kubernetes-graphql-gateway/single-access/graphql',
+      );
+      expect(options.headers()).toEqual({ Authorization: 'Bearer my-token' });
+      expect(client.subscribe.mock.calls[0][0]).toEqual({
+        query: accessReviewSubscription,
+        extensions: { clusterTarget: 'root:orgs:acme' },
+      });
+    });
+
+    it('gives the accounts of each review it is sent', () => {
+      const values: string[][] = [];
+      service
+        .watchAccounts(makeContext())
+        .subscribe((items) => values.push(items.map((i) => i.metadata.name)));
+
+      sink.next(event(review, 'ADDED'));
+      sink.next(
+        event({ status: { clusters: review.status!.clusters!.slice(0, 1) } }),
+      );
+      sink.next(event({}));
+      // Not a review: nothing to show.
+      sink.next({ data: { [accessReviewSubscriptionField]: null } });
+
+      expect(values).toEqual([['team-a', 'team-b'], ['team-b'], []]);
+    });
+
+    it('errors when the gateway reports errors or the subscription fails', () => {
+      const errors: string[] = [];
+      const watch = () =>
+        service
+          .watchAccounts(makeContext())
+          .subscribe({ error: (e) => errors.push(e.message) });
+
+      watch();
+      sink.next({ errors: [{ message: 'Cannot query field' }] });
+      watch();
+      sink.error(new Error('502'));
+
+      expect(errors).toEqual(['Cannot query field', '502']);
+    });
+
+    it('ends the subscription when it is unsubscribed from', () => {
+      service.watchAccounts(makeContext()).subscribe().unsubscribe();
+
+      expect(unsubscribe).toHaveBeenCalled();
+      expect(client.dispose).toHaveBeenCalled();
+    });
+
+    it('errors without a subscription when the workspace is unknown', () => {
+      mockGatewayService.resolveKcpPath.mockReturnValue('');
+      const error = vi.fn();
+
+      service.watchAccounts(makeContext()).subscribe({ error });
+
+      expect(error).toHaveBeenCalled();
+      expect(createClientMock).not.toHaveBeenCalled();
+    });
   });
 });

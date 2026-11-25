@@ -14,7 +14,7 @@ import {
   ResourceService,
 } from '@platform-mesh/portal-ui-lib/services';
 import * as utils from '@platform-mesh/portal-ui-lib/utils';
-import { Subject, of, throwError } from 'rxjs';
+import { NEVER, Subject, of, throwError } from 'rxjs';
 import { MockedObject } from 'vitest';
 import { mock } from 'vitest-mock-extended';
 
@@ -68,6 +68,7 @@ describe('ResourceTableCard', () => {
     );
     mockErrorHandlerService = mock();
     mockAccessReviewService = mock();
+    mockAccessReviewService.watchAccounts.mockReturnValue(NEVER);
     mockInstancePermissionsService = mock();
     // Default: checkInstances returns empty array so InstancePermissionsStore doesn't blow up
     mockInstancePermissionsService.checkInstances.mockReturnValue(of([]));
@@ -2600,6 +2601,50 @@ describe('ResourceTableCard', () => {
         expect(readFailureChange).toHaveBeenCalledWith(
           expect.objectContaining({ code: 503 }),
         );
+      });
+
+      it('shows what the review changes to while it is watched', () => {
+        const watched = new Subject<any[]>();
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          of(reviewed) as any,
+        );
+        mockAccessReviewService.watchAccounts.mockReturnValue(watched);
+        const context = makeReviewContext({ accounts: ['get'] });
+
+        const newComponent = create(context);
+
+        expect(mockAccessReviewService.watchAccounts).toHaveBeenCalledWith(
+          context(),
+        );
+
+        const created = { id: 'team-b', metadata: { name: 'team-b' } };
+        watched.next([...reviewed.items, created]);
+        expect(newComponent.resources().map((r) => r.metadata.name)).toEqual([
+          'team-a',
+          'team-b',
+        ]);
+
+        watched.next([created]);
+        expect(newComponent.resources().map((r) => r.metadata.name)).toEqual([
+          'team-b',
+        ]);
+
+        // A watch that fails leaves the list as it was.
+        watched.error(new Error('gone'));
+        expect(newComponent.resources().map((r) => r.metadata.name)).toEqual([
+          'team-b',
+        ]);
+      });
+
+      it('does not watch the review when the list fell back to the gateway', () => {
+        mockAccessReviewService.listAccounts.mockReturnValue(
+          throwError(() => new Error('404')),
+        );
+        mockAccessReviewService.watchAccounts.mockClear();
+
+        create(makeReviewContext());
+
+        expect(mockAccessReviewService.watchAccounts).not.toHaveBeenCalled();
       });
 
       it('does not ask the review unless the list view opts in', () => {

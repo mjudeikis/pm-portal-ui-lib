@@ -10,6 +10,7 @@ import {
   ResourceStatus,
   kcpRootOrgsPath,
 } from '@platform-mesh/portal-ui-lib/models';
+import { createClient } from 'graphql-sse';
 import { Observable, throwError } from 'rxjs';
 import { map } from 'rxjs/operators';
 
@@ -28,6 +29,27 @@ export const accessReviewMutation = `mutation {
             endpoint
             account { name path displayName type ready }
           }
+        }
+      }
+    }
+  }
+}`;
+
+/** The gateway's subscription to the caller's review, which it lists and watches. */
+export const accessReviewSubscriptionField =
+  'access_platform_mesh_io_v1alpha1_selfclusteraccessreviews';
+
+// Without a resource version the gateway lists first: the subscription starts
+// with the review as it is and sends it again whenever it changes.
+export const accessReviewSubscription = `subscription {
+  ${accessReviewSubscriptionField} {
+    type
+    object {
+      status {
+        clusters {
+          clusterName
+          endpoint
+          account { name path displayName type ready }
         }
       }
     }
@@ -63,6 +85,11 @@ export interface AccessReviewGraphQLResponse {
   } | null;
   errors?: { message: string }[];
 }
+
+export type AccessReviewSubscriptionData = Record<
+  typeof accessReviewSubscriptionField,
+  { type: string; object?: SelfClusterAccessReview | null } | null
+>;
 
 /**
  * Asks the access virtual workspace of kcp, through the GraphQL gateway,
@@ -113,19 +140,81 @@ export class AccessReviewService {
             throw new Error('Not an access review');
           }
 
-          const items = (review.status?.clusters ?? [])
-            .map((cluster) => cluster.account)
-            .filter(
-              (account): account is AccessReviewAccount =>
-                !!account && account.path === `${kcpPath}:${account.name}`,
-            )
-            .map((account) => this.toResource(account, nodeContext))
-            .sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
-
-          // No resource version: there is nothing to watch from.
-          return { items, resourceVersion: '', continue: undefined };
+          // No resource version: the list is kept up to date by
+          // watchAccounts, not by a watch of the resources.
+          return {
+            items: this.toResources(review, kcpPath, nodeContext),
+            resourceVersion: '',
+            continue: undefined,
+          };
         }),
       );
+  }
+
+  /**
+   * The accounts of listAccounts, again whenever the review changes: a
+   * subscription to the review through the gateway. It starts with the
+   * accounts as they are. Each value is the whole list.
+   */
+  watchAccounts(nodeContext: ResourceNodeContext): Observable<Resource[]> {
+    const kcpPath = this.gatewayService.resolveKcpPath(nodeContext);
+    const url = this.reviewUrl(nodeContext);
+    if (!url || !kcpPath) {
+      return throwError(
+        () => new Error('The access review cannot be addressed'),
+      );
+    }
+
+    return new Observable<Resource[]>((subscriber) => {
+      const client = createClient({
+        url,
+        // Per request: a reconnect after a token refresh sends the new token.
+        headers: () => ({
+          Authorization: `Bearer ${this.luigiCoreService.getAuthData()?.idToken}`,
+        }),
+      });
+      const unsubscribe = client.subscribe<AccessReviewSubscriptionData>(
+        {
+          query: accessReviewSubscription,
+          extensions: { clusterTarget: kcpPath },
+        },
+        {
+          next: (result) => {
+            if (result.errors?.length) {
+              subscriber.error(new Error(result.errors[0].message));
+              return;
+            }
+            const review = result.data?.[accessReviewSubscriptionField]?.object;
+            if (review) {
+              subscriber.next(this.toResources(review, kcpPath, nodeContext));
+            }
+          },
+          error: (error) => subscriber.error(error),
+          complete: () => subscriber.complete(),
+        },
+      );
+
+      return () => {
+        unsubscribe();
+        client.dispose();
+      };
+    });
+  }
+
+  /** The accounts of a review directly below the workspace, by name. */
+  private toResources(
+    review: SelfClusterAccessReview,
+    kcpPath: string,
+    nodeContext: ResourceNodeContext,
+  ): Resource[] {
+    return (review.status?.clusters ?? [])
+      .map((cluster) => cluster.account)
+      .filter(
+        (account): account is AccessReviewAccount =>
+          !!account && account.path === `${kcpPath}:${account.name}`,
+      )
+      .map((account) => this.toResource(account, nodeContext))
+      .sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
   }
 
   /**
